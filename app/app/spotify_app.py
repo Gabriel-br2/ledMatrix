@@ -1,6 +1,6 @@
 from app.Modules.spotify_Module import SpotifyModule as Spotify
-from image_converter import image_treatment as img_treatment
-from font import FONT
+from tools.image_converter import image_treatment as img_treatment
+from tools.font import FONT
 
 class Spoty:
     # begin class spoty with parameters 

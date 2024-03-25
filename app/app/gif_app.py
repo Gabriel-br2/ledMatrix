@@ -1,4 +1,4 @@
-from image_converter import image_treatment as img_treatment
+from tools.image_converter import image_treatment as img_treatment
 from PIL import Image
 import os
 

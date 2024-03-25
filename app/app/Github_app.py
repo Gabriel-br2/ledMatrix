@@ -2,7 +2,7 @@ import numpy as np
 from datetime import datetime
 from app.Modules.Github_Module import GitHub
 from app.Modules.GithubSnake_Module import Git_Snake
-from font import FONT
+from tools.font import FONT
 
 class git:
     def __init__(self,cfg):

@@ -1,6 +1,6 @@
 import time
 import numpy as np
-from screen import screen
+from tools.screen import screen
 from configpy import mainConfig
 from app.app.spotify_app import Spoty
 from app.app.gif_app import gif_View
@@ -19,7 +19,7 @@ gifv = gif_View(cfg.config)
 github = git(cfg.config)
 
 current_frame = 0
-current_app = 1
+current_app = 2
 delay = 10
 
 # 0: main screen
@@ -30,7 +30,7 @@ delay = 10
 # 5: pet virtual
 # 6: calendario       
 
-def main():
+def main():  
     while scr.running:
         if current_app == 1:
             main_mat = sptf.spoty_loop(main_mat, current_frame, delay)
