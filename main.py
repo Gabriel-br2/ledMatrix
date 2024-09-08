@@ -1,61 +1,38 @@
 import time
-import numpy as np
-from tools.screen import screen
+import numpy as np 
+
+from tools.font import text
+from tools.image_converter import image
+
+from screen import screen
 from configpy import mainConfig
-from app.app.spotify_app import Spoty
-from app.app.gif_app import gif_View
-from app.app.Github_app import git
 
 cfg = mainConfig()
 cfg.read_config()
 
-main_mat = np.zeros(
-    (cfg.config['screen']['y_max'], 
-     cfg.config['screen']['x_max'], 3))
+sideX = cfg.config['screen']['x_max']
+sideY = cfg.config['screen']['y_max']
 
+main_mat = np.zeros((sideY, sideX, 3))
 scr = screen(cfg.config)
-sptf = Spoty(cfg.config)
-gifv = gif_View(cfg.config)
-github = git(cfg.config)
 
-current_frame = 0
-current_app = 2
-delay = 10
+frame_rate = 0.05
 
 # 0: main screen
-# 1: spotify        OK
-# 2: gif viewer     OK
-# 3: git hub        OK
+# 1: spotify        
+# 2: gif viewer     
+# 3: git hub        
 # 4: wather update
 # 5: pet virtual
 # 6: calendario       
 
-def main():  
+def main(): 
+    global main_mat
+    
     while scr.running:
-        if current_app == 1:
-            main_mat = sptf.spoty_loop(main_mat, current_frame, delay)
-            max_frames = max((len(sptf.text_title), len(sptf.text_artist))) + delay
-            if current_frame >= max_frames or sptf.change:
-                current_frame = 0
+        scr.display(main_mat)
+        time.sleep(frame_rate)
 
-        if current_app == 2:
-            main_mat = gifv.gif_loop(current_frame)
-            max_frames = gifv.max_frame-1
-            if current_frame >= max_frames or gifv.change:
-                current_frame = 0
-            time.sleep(0.1)
-
-        if current_app == 3:
-            main_mat = github.git_loop()
-            max_frames = 0
-            if current_frame >= max_frames or False:
-                current_frame = 0
-
-        #if current_app == 4:
-
-        erect = False
-        scr.display(main_mat, erect, current_app)
-        current_frame += 1
 
 if __name__ == "__main__":
     main()

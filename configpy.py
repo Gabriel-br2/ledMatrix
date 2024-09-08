@@ -2,9 +2,7 @@ import os
 import yaml
 from datetime import datetime
 
-# Do the main Config of the aplication
 class mainConfig():
-    # Begin class with parameters
     def __init__(self):
         self.config =   {'screen': {
                             'x_max': 64,
@@ -20,7 +18,6 @@ class mainConfig():
                             'token':''
                          }}
 
-    # Read the config for the aplication
     def read_config(self):
         if not os.path.exists('config'):
             os.makedirs('config')
@@ -34,12 +31,13 @@ class mainConfig():
             with open('config/config.yaml','w') as yfile:
                 yaml.dump(self.config,yfile) 
 
-    # change a config in code
     def update_config(self):
         timestamp = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
         os.rename('config/config.yaml','config/config_%s.yaml'%timestamp)
         with open('config/config.yaml','w') as yfile:
                 yaml.dump(self.config,yfile)
 
-#a = mainConfig()
-#a.read_config()
+
+if __name__ == "__main__":
+    a = mainConfig()
+    a.read_config()

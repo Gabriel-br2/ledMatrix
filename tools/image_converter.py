@@ -3,33 +3,36 @@ from PIL import Image
 from io import BytesIO
 import requests
 
-class image_treatment:
-  def __init__(self,img,error,types):
-    self.error = error
+class image:
+  def __init__(self, link):
+    if type(link) == str:
+      if "https://" in link:
+        ans = requests.get(link, timeout=5)    
+        image_bytes = BytesIO(ans.content)
+        img = Image.open(image_bytes)
 
-    try:
-      if types == 'image': self.img = Image.open(img)
-      elif types == 'link': self.image_toPIL(img,types)
-      elif types ==  'data': self.img = img
+      else:
+        img = Image.open(link)
+
+    elif type(link) == np.ndarray: 
+      img = link
     
-    except Exception as e:
-         print(e)
-         self.img = Image.open(self.error)
+    self.img = np.asarray(img, np.uint8)  
+
+  def resize(self, nh, nw):
+    if self.img.ndim == 2: 
+      self.img = np.expand_dims(self.img, axis=2)
     
-    self.pixels = np.asarray(self.img, np.uint8)  
-
-  def image_toPIL(self,cont,types):
-    if types == 'link': 
-      ans = requests.get(cont, timeout=5)
-      cont = ans.content
-
-    elif types == 'data':
-      pass
+    self.imgResized = np.transpose(self.img,(2,0,1))  
+    channels = self.imgResized.shape[0]
+    mat_nImage = np.zeros((channels,nh,nw),np.uint8)
     
-    image_bytes = BytesIO(cont)
-    self.img = Image.open(image_bytes)
+    for c in range(channels): 
+      mat_nImage[c] = self.resize_NN_channel(self.imgResized[c],(nh,nw))
+    
+    self.imgResized = np.transpose(mat_nImage, (1,2,0))
 
-  def resize_NN_channel(self,pixels, nsize):
+  def resize_NN_channel(self, pixels, nsize):
     nh, nw = nsize
     height, width = pixels.shape[0], pixels.shape[1]
 
@@ -49,15 +52,31 @@ class image_treatment:
         npixels[i, j] = pixels[inty, intx]
     return npixels
 
-  def resize(self,nh,nw):
-    if self.pixels.ndim == 2: 
-      self.pixels = np.expand_dims(self.pixels, axis=2)
-    
-    self.pixels = np.transpose(self.pixels,(2,0,1))  
-    channels = self.pixels.shape[0]
-    self.mat_nImage = np.zeros((channels,nh,nw),np.uint8)
-    
-    for c in range(channels): 
-      self.mat_nImage[c] = self.resize_NN_channel(self.pixels[c],(nh,nw))
-    
-    self.mat_nImage = np.transpose(self.mat_nImage, (1,2,0))
+  def putImage(self, baseMat, cord):
+    y, x, _ = self.imgResized.shape
+    baseMat[cord[1]:y+cord[1], cord[0]:x+cord[0], :] = self.imgResized
+    return baseMat
+
+if __name__ == "__main__":
+  import matplotlib.pyplot as plt
+  # import tools.image_converter as Itreatment
+
+  # test images
+  path = "resource/test.jpg"
+  link = "https://images.ctfassets.net/hrltx12pl8hq/7JnR6tVVwDyUM8Cbci3GtJ/bf74366cff2ba271471725d0b0ef418c/shutterstock_376532611-og.jpg"
+  
+  imagePath = image(path)
+  imagePath.resize(32, 64)
+
+  imageLink = image(link)
+  imageLink.resize(32, 64)
+
+  fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+
+  axs[0].imshow(imagePath.imgResized)
+  axs[0].axis('off')  
+
+  axs[1].imshow(imageLink.imgResized)
+  axs[1].axis('off')  
+
+  plt.show()
