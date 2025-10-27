@@ -8,10 +8,10 @@ from typing import Any
 import numpy as np
 from dotenv import load_dotenv
 
-from registry import get_registry
 from screen import screen
 from utils import cfg
 from utils.log import log
+from utils.registry import get_registry
 
 load_dotenv()
 

@@ -6,10 +6,10 @@ import numpy as np
 from app.__base__ import baseApp
 from app.modules.git_module import GitHub
 from app.modules.snake_module import snake
-from registry import register_object
 from tools.font import Font
 from tools.image_rescale import image
 from utils import cfg
+from utils.registry import register_object
 
 
 @register_object("app", "git_app")

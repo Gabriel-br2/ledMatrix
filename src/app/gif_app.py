@@ -8,9 +8,9 @@ from PIL import ImageDraw
 from PIL import ImageSequence
 
 from app.__base__ import baseApp
-from registry import register_object
 from tools.image_rescale import image as image_tool
 from utils import cfg
+from utils.registry import register_object
 
 
 @register_object("app", "gif_app")

@@ -169,6 +169,8 @@ class Font:
     def put(self, base: np.array) -> np.array:
         h, w = self.offset
 
-        base[h : self.h + h, w : self.w + w] = self.image_mat[self.actual_frame]
-
+        try:
+            base[h : self.h + h, w : self.w + w] = self.image_mat[self.actual_frame]
+        except IndexError as e:
+            log.error(f"Index error: {e}")
         return base
