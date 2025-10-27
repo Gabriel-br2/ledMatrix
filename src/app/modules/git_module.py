@@ -18,14 +18,15 @@ class GitHub:
         self.url_repos: str = f"https://api.github.com/users/{self.user}/repos"
         self.auth: dict[str, str] = {"Authorization": f"token {self.token}"}
 
+        self.last: str = ""
         self.base_mat = None
         self.path: str = path
         self.point: list = []
         self.commits: list = []
         self.data_repos: list = []
 
-        self.tamX = cfg.config["screen"]["x_max"]
-        self.tamY = cfg.config["screen"]["y_max"]
+        self.tamX: int = cfg.config["screen"]["x_max"]
+        self.tamY: int = cfg.config["screen"]["y_max"]
 
     def date_check(self):
         self.today: datetime = datetime.today()
@@ -142,3 +143,28 @@ class GitHub:
             log.error(f"Error: file {self.filename} not found.")
         except Exception as e:
             log.error(f"Error in {self.filename} git fetch: {e}")
+
+    def get_last_repo_updated(self) -> dict | None:
+        query_params = {"sort": "pushed", "direction": "desc", "per_page": 1}
+
+        try:
+            response = requests.get(
+                self.url_repos, headers=self.auth, params=query_params, timeout=5
+            )
+            response.raise_for_status()
+
+            data = response.json()
+
+            if data:
+                ultimo_repo = data[0]
+                nome_repo = ultimo_repo["name"]
+                ultimo_push = ultimo_repo["pushed_at"]
+                log.info(f"last Repo: {nome_repo} (last push: {ultimo_push})")
+                self.last = nome_repo
+            else:
+                log.warning("Repo not found")
+
+        except requests.exceptions.RequestException as e:
+            log.warning(f"Connection Error in last_repo_updated: {e}")
+        except Exception as e:
+            log.error(f"Error in last_repo_updated: {e}")
