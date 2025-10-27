@@ -23,10 +23,13 @@ class GitHub:
         self.path: str = path
         self.point: list = []
         self.commits: list = []
+        self.mat: np.array = None
         self.data_repos: list = []
 
         self.tamX: int = cfg.config["screen"]["x_max"]
         self.tamY: int = cfg.config["screen"]["y_max"]
+
+        self.date_check()
 
     def date_check(self):
         self.today: datetime = datetime.today()
