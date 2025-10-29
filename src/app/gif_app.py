@@ -1,4 +1,5 @@
 import os
+import random
 from typing import List
 from typing import Set
 
@@ -17,7 +18,6 @@ from utils.registry import register_object
 class gif_app(baseApp):
     def __init__(self, app_id: int = 0) -> None:
         super().__init__(app_id=app_id, name="GIF Viewer")
-        self.current_giff: int = 0
         self.fps_app: float = 0.01
 
         path: str = cfg.config["main"]["path"]
@@ -31,7 +31,10 @@ class gif_app(baseApp):
         for base, processed in diff.items():
             self.create_gif(base, processed)
 
-        gif_app
+        self.current_giff: int = random.randint(0, self.total_gifs - 1)
+        while self.current_giff in [2]:
+            self.current_giff: int = random.randint(0, self.total_gifs - 1)
+
         self.current: np.array = self.load(gif_path[self.current_giff])
         self.total_frames: int = len(self.current)
 
