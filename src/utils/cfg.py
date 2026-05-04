@@ -1,6 +1,8 @@
 from typing import Any
 
-config: dict[str, Any] = {
+from config.json import JsonConfigManager
+
+DEFAULT_JSON_PAYLOAD: dict[str, Any] = {
     "screen": {
         "x_max": 64,
         "y_max": 32,
@@ -11,3 +13,6 @@ config: dict[str, Any] = {
         "path": "/home/gabriel/Documents/code/ledMatrix/",
     },
 }
+
+json_manager = JsonConfigManager("CONFIG/config.json", DEFAULT_JSON_PAYLOAD)
+config = json_manager.load()

@@ -5,3 +5,4 @@ __pycache__/
 .venv_path
 resource/
 processed_resource/
+.cache

@@ -1,5 +1,13 @@
+"""
+GitHub Contribution Heatmap App.
+DEV     : Gabriel Rocha de Souza
+PROJECT : ledMatrix
+"""
+
 import os
 import threading
+from dataclasses import dataclass
+from dataclasses import field
 
 import numpy as np
 
@@ -7,135 +15,150 @@ from app.__base__ import baseApp
 from app.modules.git_module import GitHub
 from app.modules.snake_module import snake
 from tools.font import Font
-from tools.image_rescale import image
+from tools.image_rescale import ImageRescale
 from utils import cfg
+from utils.log import log
 from utils.registry import register_object
 
 
-@register_object("app", "git_app")
-class git_app(baseApp):
-    def __init__(self, app_id: int = 0) -> None:
-        super().__init__(app_id=app_id, name="GIT Hub App")
-        self.fetching_info: bool = True
-        self.fetching: bool = False
-        self.fps_app: float = 0.05
-        self.base: np.array = None
-        self.map_ready: bool = False
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-        path: str = cfg.config["main"]["path"]
-        self.module: GitHub = GitHub(path=path + f"processed_resource/commits/")
-        self.snake: snake = snake((150, 0, 255))
-        self.module.load()
+_FONT_SIZE: int = 5
+_TEXT_LIMIT: int = 43
+_LOGO_SIZE: int = 16
 
-        is_outdated = self.module.date_check()
-        load_failed = self.module.base_mat is None
+_TEXT_COLOR_WHITE: tuple = (255, 255, 255)
+_TEXT_COLOR_PURPLE: tuple = (150, 0, 255)
+_SNAKE_COLOR: tuple = (150, 0, 255)
 
-        if is_outdated or load_failed:
-            self.fetching = True
-            self.map_ready = False
-            self.base = np.zeros(
-                (cfg.config["screen"]["y_max"], cfg.config["screen"]["x_max"], 3)
-            )
-            thread_load = threading.Thread(target=self.threading_load)
-            thread_load.start()
-        else:
-            self.fetching = False
-            self.map_ready = True
-            self.base = self.module.base_mat.copy()
-            self.snake.convert_matrix(self.base)
-            self.snake.choose_target()
 
-        self.title = Font(
-            tam=5, text=f"GitHub: {os.getenv("GIT_USER")}", offset=(20, 1)
-        )
+# ---------------------------------------------------------------------------
+# Data containers
+# ---------------------------------------------------------------------------
 
-        self.last_repo = Font(
-            tam=5,
-            text=f"last push in repo: {self.module.last}",
-            offset=(26, 1),
-            map_color=[0, 18],
-            color=[(255, 255, 255), (150, 0, 255)],
-        )
 
-        self.title.limit(43)
-        self.last_repo.limit(43)
+@dataclass
+class _TextState:
+    """Groups the two scrolling Font objects and their shared frame count."""
 
-        self.total_frames: int = max(self.title.frames, self.last_repo.frames)
+    title: Font
+    last_repo: Font
+    total_frames: int = 1
 
+    def sync_frames(self) -> None:
+        """Align both fonts to the same total frame count."""
+        self.total_frames = max(self.title.frames, self.last_repo.frames)
         self.title.extern_limit(self.total_frames)
         self.last_repo.extern_limit(self.total_frames)
 
-        thread_info = threading.Thread(target=self.threading_info)
-        thread_info.start()
-
-        self.logo = image(img=path + "resource/giticon.png", scale=(16, 16))
-
-    def threading_info(self) -> None:
-        self.module.get_last_repo_updated()
-
-        self.last_repo.update_text(text=f"Last push in repo: {self.module.last}")
-        self.last_repo.limit(43)
-
-        self.total_frames: int = max(self.title.frames, self.last_repo.frames)
-        self.title.extern_limit(self.total_frames)
-        self.last_repo.extern_limit(self.total_frames)
-
-        self.fetching_info = False
-
-    def threading_load(self) -> None:
-        self.module.pipeline()
-        self.module.load()
-
-        if self.module.base_mat is not None:
-            self.base = self.module.base_mat.copy()
-            self.snake.convert_matrix(self.base)
-            self.snake.reset_cycle()
-        else:
-            self.base = np.zeros(
-                (cfg.config["screen"]["y_max"], cfg.config["screen"]["x_max"], 3)
-            )
-            self.map_ready = False
-            self.fetching = False
-            return
-
-        self.map_ready = True
-        self.fetching = False
-
-    def main_loop_app(self, base: np.array) -> np.array:
-        if self.module.date_check() and not self.fetching:
-            self.fetching = True
-            self.map_ready = False
-            thread_load = threading.Thread(target=self.threading_load)
-            thread_load.start()
-        base[:] = self.base
-
-        if not self.fetching and self.map_ready:
-            self.snake.go_for_target()
-            base = self.snake.put_head(base=base)
-
-        base = self.title.put(base=base)
-        base = self.last_repo.put(base=base)
-        base[-self.logo.scaleY - 1 : -1, -self.logo.scaleX - 1 : -1] = self.logo.resized
-
+    def advance(self) -> None:
         self.title += 1
         self.last_repo += 1
 
+    def put(self, base: np.ndarray) -> np.ndarray:
+        base = self.title.put(base=base)
+        base = self.last_repo.put(base=base)
         return base
 
-    def reset_snake_state(self) -> None:
-        if self.map_ready:
-            self.snake.reset_cycle()
 
-        if not self.fetching_info:
-            self.fetching_info = True
-            thread_info = threading.Thread(target=self.threading_info)
-            thread_info.start()
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+
+@register_object("app", "git_app")
+class GitApp(baseApp):
+    """
+    Displays the GitHub contribution heatmap with an animated snake overlay.
+
+    Startup sequence
+    ----------------
+    1. Try to load today's cached wallpaper from disk.
+    2. If missing or stale → spawn ``_thread_load`` to fetch from the API.
+    3. Spawn ``_thread_info`` immediately to refresh the last-pushed repo label.
+    """
+
+    def __init__(self, app_id: int = 0) -> None:
+        super().__init__(app_id=app_id, name="GitHub App")
+
+        self.fps_app: float = 0.05
+
+        path: str = cfg.config["main"]["path"]
+
+        # --- Module ---
+        self.module: GitHub = GitHub(path=path + "processed_resource/commits/")
+        self.module.load()
+
+        # --- State flags ---
+        self._fetching: bool = False
+        self._fetching_info: bool = False
+        self._map_ready: bool = False
+
+        # --- Canvas ---
+        _empty = self._empty_canvas()
+        self.base: np.ndarray = _empty
+
+        # --- Snake ---
+        self.snake: snake = snake(_SNAKE_COLOR)
+
+        # --- Boot: wallpaper ---
+        if self.module.needs_refresh() or self.module.base_mat is None:
+            log.info("Wallpaper missing or stale — fetching from API.")
+            self._start_load_thread()
+        else:
+            self.base = self.module.base_mat.copy()
+            self.snake.convert_matrix(self.base)
+            self.snake.choose_target()
+            self._map_ready = True
+
+        # --- Text ---
+        self._text: _TextState = self._build_text_state()
+
+        # --- Info thread (last repo label) ---
+        self._start_info_thread()
+
+        # --- Logo ---
+        self.logo: ImageRescale = ImageRescale(
+            source=path + "resource/giticon.png",
+            scale=(_LOGO_SIZE, _LOGO_SIZE),
+        )
+
+        self.total_frames: int = self._text.total_frames
+
+    # ------------------------------------------------------------------
+    # baseApp contract
+    # ------------------------------------------------------------------
+
+    def main_loop_app(self, base: np.ndarray) -> np.ndarray:
+        # Trigger a refresh if the cached wallpaper is now outdated.
+        if self.module.needs_refresh() and not self._fetching:
+            log.info("Date rollover detected — refreshing wallpaper.")
+            self._map_ready = False
+            self._start_load_thread()
+
+        base[:] = self.base
+
+        if not self._fetching and self._map_ready:
+            self.snake.go_for_target()
+            base = self.snake.put_head(base=base)
+
+        base = self._text.put(base)
+
+        sy, sx = self.logo.scaleY, self.logo.scaleX
+        base[-sy - 1 : -1, -sx - 1 : -1] = self.logo.resized
+
+        self._text.advance()
+        self.total_frames = self._text.total_frames
+
+        return base
 
     def on_exit(self) -> None:
         pass
 
     def _button_short_click(self) -> None:
-        self.reset_snake_state()
+        self._reset_snake_and_info()
 
     def _button_left(self) -> None:
         pass
@@ -145,3 +168,84 @@ class git_app(baseApp):
 
     def _button_long_click(self) -> None:
         pass
+
+    # ------------------------------------------------------------------
+    # Threads
+    # ------------------------------------------------------------------
+
+    def _start_load_thread(self) -> None:
+        self._fetching = True
+        threading.Thread(target=self._thread_load, daemon=True).start()
+
+    def _start_info_thread(self) -> None:
+        self._fetching_info = True
+        threading.Thread(target=self._thread_info, daemon=True).start()
+
+    def _thread_load(self) -> None:
+        """Background: fetch API → generate wallpaper → reload."""
+        self.module.pipeline()
+        self.module.load()
+
+        if self.module.base_mat is not None:
+            self.base = self.module.base_mat.copy()
+            self.snake.convert_matrix(self.base)
+            self.snake.reset_cycle()
+            self._map_ready = True
+        else:
+            log.error("Wallpaper generation failed — displaying blank canvas.")
+            self.base = self._empty_canvas()
+            self._map_ready = False
+
+        self._fetching = False
+
+    def _thread_info(self) -> None:
+        """Background: fetch last-pushed repo and update the label."""
+        self.module.get_last_repo_updated()
+
+        self._text.last_repo.update_text(f"Last push in repo: {self.module.last}")
+        self._text.last_repo.limit(_TEXT_LIMIT)
+        self._text.sync_frames()
+        self.total_frames = self._text.total_frames
+
+        self._fetching_info = False
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _reset_snake_and_info(self) -> None:
+        if self._map_ready:
+            self.snake.reset_cycle()
+
+        if not self._fetching_info:
+            self._start_info_thread()
+
+    def _build_text_state(self) -> _TextState:
+        username = os.getenv("GIT_USER", "")
+
+        title = Font(
+            size=_FONT_SIZE,
+            text=f"GitHub: {username}",
+            offset=(20, 1),
+        )
+
+        last_repo = Font(
+            size=_FONT_SIZE,
+            text=f"last push in repo: {self.module.last}",
+            offset=(26, 1),
+            map_color=[0, 18],
+            color=[_TEXT_COLOR_WHITE, _TEXT_COLOR_PURPLE],
+        )
+
+        title.limit(_TEXT_LIMIT)
+        last_repo.limit(_TEXT_LIMIT)
+
+        state = _TextState(title=title, last_repo=last_repo)
+        state.sync_frames()
+        return state
+
+    @staticmethod
+    def _empty_canvas() -> np.ndarray:
+        y = cfg.config["screen"]["y_max"]
+        x = cfg.config["screen"]["x_max"]
+        return np.zeros((y, x, 3), dtype=np.uint8)

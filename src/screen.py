@@ -1,3 +1,11 @@
+"""
+Pygame Display Driver and Input Handler.
+DEV     : Gabriel Rocha de Souza
+PROJECT : ledMatrix
+"""
+
+from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
 from typing import Callable
 
@@ -8,86 +16,202 @@ from utils import cfg
 from utils.log import log
 
 
-class screen:
-    def __init__(self, button_handler: Callable[str, None]) -> None:
-        pygame.init()
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
 
-        self.running: bool = True
-        self.actual_frame: list = []
-        self.last_change_state: bool = None
-        self.button_handler: Callable[str, None] = button_handler
+type ButtonHandler = Callable[[str], Any]
+type Color = tuple[int, int, int]
 
-        self.x_max: int = cfg.config["screen"]["x_max"]
-        self.y_max: int = cfg.config["screen"]["y_max"]
 
-        self.tam_pixel: int = cfg.config["screen"]["tam_pixel"]
-        self.tam_space: int = cfg.config["screen"]["tam_space"]
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-        self.screen: screen = pygame.display.set_mode(
-            (
-                (self.tam_pixel * self.x_max) + (self.tam_space * (self.x_max + 1)),
-                (self.tam_pixel * self.y_max) + (self.tam_space * (self.y_max + 1)),
-            )
+BACKGROUND_COLOR: Color = (37, 37, 37)
+BORDER_COLOR: Color = (255, 255, 255)
+
+LONG_PRESS_THRESHOLD_MS: int = 750
+
+
+# ---------------------------------------------------------------------------
+# Data containers
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _DisplayConfig:
+    """Immutable geometry derived from the project config at startup."""
+
+    x_max: int
+    y_max: int
+    pixel_size: int
+    gap_size: int
+
+    @property
+    def window_width(self) -> int:
+        return self.pixel_size * self.x_max + self.gap_size * (self.x_max + 1)
+
+    @property
+    def window_height(self) -> int:
+        return self.pixel_size * self.y_max + self.gap_size * (self.y_max + 1)
+
+    @classmethod
+    def from_cfg(cls) -> "_DisplayConfig":
+        s = cfg.config["screen"]
+        return cls(
+            x_max=s["x_max"],
+            y_max=s["y_max"],
+            pixel_size=s["tam_pixel"],
+            gap_size=s["tam_space"],
         )
 
-        self.map_buttons: dict[Any, str] = {
-            pygame.KEYDOWN: {
-                pygame.K_LEFT: "left_click",
-                pygame.K_RIGHT: "right_click",
-                pygame.K_SPACE: "enter_press",
-            },
-            pygame.KEYUP: {
-                pygame.K_SPACE: "enter_release",
-            },
-        }
 
-        self.INVERT_THRESHOLD: int = 750
+@dataclass
+class _RenderState:
+    """Tracks the last rendered frame to skip redundant draws."""
+
+    last_frame: np.ndarray = field(default_factory=lambda: np.array([]))
+    last_change_mode: bool | None = None
+
+    def is_dirty(self, frame: np.ndarray, change: bool) -> bool:
+        """Return True when the display needs to be redrawn."""
+        return (
+            not np.array_equal(frame, self.last_frame)
+            or self.last_change_mode != change
+        )
+
+    def update(self, frame: np.ndarray, change: bool) -> None:
+        self.last_frame = np.copy(frame)
+        self.last_change_mode = change
+
+
+# ---------------------------------------------------------------------------
+# Button mapping
+# ---------------------------------------------------------------------------
+
+_BUTTON_MAP: dict[int, dict[int, str]] = {
+    pygame.KEYDOWN: {
+        pygame.K_LEFT: "left_click",
+        pygame.K_RIGHT: "right_click",
+        pygame.K_SPACE: "enter_press",
+    },
+    pygame.KEYUP: {
+        pygame.K_SPACE: "enter_release",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Screen
+# ---------------------------------------------------------------------------
+
+
+class Screen:
+    """
+    Owns the Pygame window, the render loop, and keyboard input dispatch.
+
+    On every call to :meth:`display` it:
+
+    1. Drains the Pygame event queue and forwards mapped keys to *button_handler*.
+    2. Redraws the LED grid only when the pixel matrix or the change-mode flag
+       has actually changed (dirty-check via :class:`_RenderState`).
+
+    Parameters
+    ----------
+    button_handler:
+        Callable invoked with a ``str`` event name whenever a mapped key fires.
+    """
+
+    def __init__(self, button_handler: ButtonHandler) -> None:
+        pygame.init()
+
+        self._cfg: _DisplayConfig = _DisplayConfig.from_cfg()
+        self._state: _RenderState = _RenderState()
+        self._handler: ButtonHandler = button_handler
+
+        self.running: bool = True
+
+        self._surface: pygame.Surface = pygame.display.set_mode(
+            (self._cfg.window_width, self._cfg.window_height)
+        )
 
         log.info("Screen initialized.")
 
-    def _button_press(self) -> None:
+    # ------------------------------------------------------------------
+    # Input
+    # ------------------------------------------------------------------
+
+    def _poll_events(self) -> None:
+        """Drain the Pygame event queue and dispatch mapped button events."""
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 log.info("Quit event detected. Shutting down screen.")
                 self.running = False
+                return
 
-            if event.type in self.map_buttons:
-                action = self.map_buttons.get(event.type, None)
-                event = action.get(event.key, None)
+            key_map = _BUTTON_MAP.get(event.type)
+            if key_map is None:
+                continue
 
-                self.button_handler(event)
+            action = key_map.get(event.key)
+            if action is not None:
+                self._handler(action)
 
-    def display(self, matriz: np.array, change: bool) -> None:
-        self._button_press()
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
 
-        if (
-            not np.array_equal(matriz, self.actual_frame)
-            or self.last_change_state != change
-        ):
-            self.actual_frame = np.copy(matriz)
-            self.last_change_state = change
+    def _draw(self, matrix: np.ndarray, change: bool) -> None:
+        """Render the full LED grid to the Pygame surface."""
+        cfg = self._cfg
+        self._surface.fill(BACKGROUND_COLOR)
 
-            self.screen.fill((37, 37, 37))
+        y = cfg.gap_size
 
-            y = self.tam_space
+        for row in range(cfg.y_max):
+            x = cfg.gap_size
 
-            for j in range(self.y_max):
-                x = self.tam_space
+            for col in range(cfg.x_max):
+                color: Color = tuple(matrix[row][col])
 
-                for k in range(self.x_max):
-                    color = matriz[j][k].copy()
-                    if change:
-                        if j in [0, self.y_max - 1] or k in [0, self.x_max - 1]:
-                            color = (255, 255, 255)
+                if change and (row in (0, cfg.y_max - 1) or col in (0, cfg.x_max - 1)):
+                    color = BORDER_COLOR
 
-                    pygame.draw.rect(
-                        self.screen, color, ((x, y, self.tam_pixel, self.tam_pixel))
-                    )
+                pygame.draw.rect(
+                    self._surface,
+                    color,
+                    (x, y, cfg.pixel_size, cfg.pixel_size),
+                )
+                x += cfg.pixel_size + cfg.gap_size
 
-                    x += self.tam_pixel + self.tam_space
-                y += self.tam_pixel + self.tam_space
+            y += cfg.pixel_size + cfg.gap_size
 
-            pygame.display.flip()
+        pygame.display.flip()
 
-            if not self.running:
-                pygame.quit()
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def display(self, matriz: np.ndarray, change: bool) -> None:
+        """
+        Poll input events and conditionally redraw the LED matrix.
+
+        Parameters
+        ----------
+        matriz:
+            A ``(y_max, x_max, 3)`` uint8 array of RGB pixel values.
+        change:
+            When *True*, the border pixels are highlighted to signal
+            that the device is in app-switching mode.
+        """
+        self._poll_events()
+
+        if not self._state.is_dirty(matriz, change):
+            return
+
+        self._state.update(matriz, change)
+        self._draw(matriz, change)
+
+        if not self.running:
+            pygame.quit()

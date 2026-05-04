@@ -6,7 +6,7 @@ _registry: list[tuple[str, str, Callable[..., None]]] = []
 
 
 def register_object(group: str, name: str):
-    def decorator(func: Callable[..., None]):
+    def decorator(func: Callable[..., Any]):
         @wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             return func(*args, **kwargs)

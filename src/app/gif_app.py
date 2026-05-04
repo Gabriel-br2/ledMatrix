@@ -1,136 +1,200 @@
+"""
+GIF Viewer App — Animated GIF Player with Pre-processing Pipeline.
+DEV     : Gabriel Rocha de Souza
+PROJECT : ledMatrix
+"""
+
 import os
 import random
-from typing import List
-from typing import Set
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from PIL import ImageDraw
 from PIL import ImageSequence
 
 from app.__base__ import baseApp
-from tools.image_rescale import image as image_tool
+from tools.image_rescale import ImageRescale
 from utils import cfg
+from utils.log import log
 from utils.registry import register_object
 
 
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+
+type GifFrames = list[np.ndarray]
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_EXCLUDED_INDICES: frozenset[int] = frozenset({2})  # GIF slots to skip on random pick
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+
 @register_object("app", "gif_app")
-class gif_app(baseApp):
+class GifApp(baseApp):
+    """
+    Plays animated GIFs from disk, rescaling them to the display resolution
+    on first use and caching the result as a processed GIF.
+
+    Navigation
+    ----------
+    - Left arrow  → previous GIF.
+    - Right arrow → next GIF.
+    """
+
     def __init__(self, app_id: int = 0) -> None:
         super().__init__(app_id=app_id, name="GIF Viewer")
+
         self.fps_app: float = 0.01
 
         path: str = cfg.config["main"]["path"]
-        diff, gif_path = self.check_processed_gifs(
-            dir_base=path + "resource/gifs",
-            dir_processed=path + "processed_resource/gifs",
+
+        pending, self._gif_paths = self._scan_gifs(
+            raw_dir=Path(path) / "resource" / "gifs",
+            processed_dir=Path(path) / "processed_resource" / "gifs",
         )
 
-        self.gif_path = gif_path
-        self.total_gifs: int = len(gif_path)
-        for base, processed in diff.items():
-            self.create_gif(base, processed)
+        for raw, processed in pending.items():
+            log.info(f"Pre-processing GIF: {raw.name}")
+            self._preprocess(raw, processed)
 
-        self.current_giff: int = random.randint(0, self.total_gifs - 1)
-        while self.current_giff in [2]:
-            self.current_giff: int = random.randint(0, self.total_gifs - 1)
+        self._total_gifs: int = len(self._gif_paths)
+        self._current_index: int = self._pick_random()
 
-        self.current: np.array = self.load(gif_path[self.current_giff])
-        self.total_frames: int = len(self.current)
+        self.current: GifFrames = self._load(self._gif_paths[self._current_index])
+        self.total_frames: int | None = len(self.current)
 
-    def check_processed_gifs(self, dir_base: str, dir_processed: str) -> List[str]:
-        if not os.path.isdir(dir_base):
-            raise FileNotFoundError(f"Gif base directory not found: {dir_base}")
-        if not os.path.isdir(dir_processed):
-            raise FileNotFoundError(
-                f"Gif processed directory not found: {dir_processed}"
-            )
+    # ------------------------------------------------------------------
+    # baseApp contract
+    # ------------------------------------------------------------------
 
-        def explore(dir_name: str) -> set[tuple[str]]:
-            files_names: Set[str] = set()
-            files_paths: Set[str] = set()
-
-            for item_name in os.listdir(dir_name):
-                completed_path: str = os.path.join(dir_name, item_name)
-                if os.path.isfile(completed_path):
-                    files_names.add(item_name)
-                    files_paths.add(completed_path)
-            return files_names, files_paths
-
-        base_names, base_paths = explore(dir_base)
-        processed_names, processed_paths = explore(dir_processed)
-
-        unitary_files: Set[str] = base_names - processed_names
-        diff: dict[str] = {
-            dir_base + "/" + i: dir_processed + "/" + i for i in unitary_files
-        }
-
-        total_paths = list(processed_paths) + list(diff.values())
-        total_paths.sort()
-
-        return diff, total_paths
-
-    def load(self, path: str) -> List[np.array]:
-        img_gif = Image.open(path)
-        frames: List[np.array] = []
-
-        for frame in ImageSequence.Iterator(img_gif):
-            frame_rgba = frame.convert("RGB")
-            frames.append(np.array(frame_rgba, np.uint8))
-
-        return frames
-
-    def create_gif(self, path_input: str, path_output: str) -> None:
-        img_gif = Image.open(path_input)
-        frames_pil: List[Image.Image] = []
-        frames: List[np.array] = []
-        timers: List[int] = []
-
-        for frame in ImageSequence.Iterator(img_gif):
-            frame_rgba = frame.convert("RGBA")
-            frame_rescaled = image_tool(
-                img=frame_rgba,
-                scale=(cfg.config["screen"]["y_max"], cfg.config["screen"]["x_max"]),
-            )
-
-            frames.append(frame_rescaled.resized)
-            frames_pil.append(
-                Image.fromarray(frame_rescaled.resized.astype(np.uint8), "RGBA")
-            )
-            timers.append(frame.info["duration"])
-
-        frames_pil = [
-            Image.fromarray(frame.astype(np.uint8), "RGBA") for frame in frames
-        ]
-
-        frames_pil[0].save(
-            path_output,
-            save_all=True,
-            append_images=frames_pil[1:],
-            duration=timers,
-            loop=0,
-            optimize=False,
-        )
-
-    def main_loop_app(self, base: np.array) -> None:
+    def main_loop_app(self, base: np.ndarray) -> np.ndarray:
         return self.current[self.actual_frame]
-
-    def change_gif(self, change: int) -> None:
-        self.current_giff = (self.current_giff + change) % self.total_gifs
-        self.current: np.array = self.load(self.gif_path[self.current_giff])
-        self.total_frames: int = len(self.current)
-
-    def _button_left(self) -> None:
-        self.change_gif(change=-1)
-
-    def _button_right(self) -> None:
-        self.change_gif(change=+1)
 
     def on_exit(self) -> None:
         pass
+
+    def _button_left(self) -> None:
+        self._change_gif(delta=-1)
+
+    def _button_right(self) -> None:
+        self._change_gif(delta=+1)
 
     def _button_short_click(self) -> None:
         pass
 
     def _button_long_click(self) -> None:
         pass
+
+    # ------------------------------------------------------------------
+    # Internal — GIF management
+    # ------------------------------------------------------------------
+
+    def _change_gif(self, delta: int) -> None:
+        """Advance or rewind the GIF carousel by *delta* steps."""
+        self._current_index = (self._current_index + delta) % self._total_gifs
+        self.current = self._load(self._gif_paths[self._current_index])
+        self.total_frames: int | None = len(self.current)
+
+    def _pick_random(self) -> int:
+        """Return a random GIF index, skipping :data:`_EXCLUDED_INDICES`."""
+        available = [i for i in range(self._total_gifs) if i not in _EXCLUDED_INDICES]
+        return random.choice(available) if available else 0
+
+    # ------------------------------------------------------------------
+    # Internal — file I/O
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _scan_gifs(
+        raw_dir: Path,
+        processed_dir: Path,
+    ) -> tuple[dict[Path, Path], list[Path]]:
+        """
+        Compare *raw_dir* and *processed_dir* to find GIFs that need processing.
+
+        Returns
+        -------
+        pending:
+            Mapping of ``raw_path → processed_path`` for unprocessed GIFs.
+        all_processed:
+            Sorted list of all paths in *processed_dir* (including newly pending).
+        """
+        if not raw_dir.is_dir():
+            raise FileNotFoundError(f"GIF source directory not found: {raw_dir}")
+        if not processed_dir.is_dir():
+            raise FileNotFoundError(
+                f"GIF processed directory not found: {processed_dir}"
+            )
+
+        raw_names = {f.name for f in raw_dir.iterdir() if f.is_file()}
+        processed_names = {f.name for f in processed_dir.iterdir() if f.is_file()}
+
+        unprocessed = raw_names - processed_names
+
+        pending: dict[Path, Path] = {
+            raw_dir / name: processed_dir / name for name in unprocessed
+        }
+
+        all_processed = sorted(
+            [processed_dir / name for name in processed_names] + list(pending.values())
+        )
+
+        return pending, all_processed
+
+    @staticmethod
+    def _load(path: Path) -> GifFrames:
+        """Load a GIF from *path* and return its frames as a list of RGB arrays."""
+        gif = Image.open(path)
+        frames: GifFrames = []
+
+        for frame in ImageSequence.Iterator(gif):
+            frames.append(np.array(frame.convert("RGB"), dtype=np.uint8))
+
+        return frames
+
+    @staticmethod
+    def _preprocess(raw: Path, output: Path) -> None:
+        """
+        Rescale every frame of *raw* to the display resolution and save the
+        result as a new GIF at *output*.
+
+        The processed file is used on all subsequent loads, avoiding per-frame
+        rescaling at runtime.
+        """
+        target_h: int = cfg.config["screen"]["y_max"]
+        target_w: int = cfg.config["screen"]["x_max"]
+
+        gif = Image.open(raw)
+        frames_pil: list[Image.Image] = []
+        timers: list[int] = []
+
+        for frame in ImageSequence.Iterator(gif):
+            rescaled = ImageRescale(
+                source=frame.convert("RGBA"),
+                scale=(target_h, target_w),
+            )
+            frames_pil.append(
+                Image.fromarray(rescaled.resized.astype(np.uint8), "RGBA")
+                if rescaled.resized
+                else frame.convert("RGBA")
+            )
+            timers.append(frame.info.get("duration", 100))
+
+        frames_pil[0].save(
+            output,
+            save_all=True,
+            append_images=frames_pil[1:],
+            duration=timers,
+            loop=0,
+            optimize=False,
+        )
+        log.info(f"GIF saved to: {output}")

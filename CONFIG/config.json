@@ -1,0 +1,11 @@
+{
+    "main": {
+        "path": "/home/gabriel/Documents/code/ledMatrix/"
+    },
+    "screen": {
+        "tam_pixel": 15,
+        "tam_space": 5,
+        "x_max": 64,
+        "y_max": 32
+    }
+}

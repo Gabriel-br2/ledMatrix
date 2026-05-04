@@ -1,6 +1,21 @@
+"""
+GitHub API Connector — Commit Heatmap Generator.
+DEV     : Gabriel Rocha de Souza
+PROJECT : ledMatrix
+"""
+
+import functools
 import glob
 import os
+import time
+from dataclasses import dataclass
+from dataclasses import field
 from datetime import datetime
+from pathlib import Path
+from typing import Any
+from typing import Callable
+from typing import cast
+from typing import TypeVar
 
 import numpy as np
 import requests
@@ -10,164 +25,336 @@ from utils import cfg
 from utils.log import log
 
 
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+
+type CommitDate = list[int]  # [year, month, day]
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_API_BASE: str = "https://api.github.com"
+_TIMEOUT: int = 5
+_MAX_LEVEL: int = 3  # commit density cap (maps to 4 shades: 0–3)
+_SHADE_STEP: int = 85  # 85 * 3 = 255
+
+
+# ---------------------------------------------------------------------------
+# Decorators
+# ---------------------------------------------------------------------------
+
+
+def _retry_on_network_error(
+    max_attempts: int = 3,
+    delay: float = 2.0,
+) -> Callable[[F], F]:
+    """Re-attempt an API call up to *max_attempts* times on network failure."""
+
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except requests.exceptions.RequestException as e:
+                    if attempt == max_attempts:
+                        log.error(
+                            f"[RETRY] '{func.__name__}' failed after "
+                            f"{max_attempts} attempts: {e}"
+                        )
+                        raise
+                    log.warning(
+                        f"[RETRY] '{func.__name__}' attempt {attempt}/{max_attempts} "
+                        f"failed ({e}). Retrying in {delay}s…"
+                    )
+                    time.sleep(delay)
+
+        return cast(F, wrapper)
+
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# Data containers
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _GitHubConfig:
+    """Credentials and derived URLs loaded once at startup."""
+
+    user: str
+    token: str
+
+    @property
+    def auth_header(self) -> dict[str, str]:
+        return {"Authorization": f"token {self.token}"}
+
+    @property
+    def repos_url(self) -> str:
+        return f"{_API_BASE}/users/{self.user}/repos"
+
+    def commits_url(self, repo_name: str) -> str:
+        return f"{_API_BASE}/repos/{self.user}/{repo_name}/commits"
+
+    @classmethod
+    def from_env(cls) -> "_GitHubConfig":
+        user = os.getenv("GIT_USER", "")
+        token = os.getenv("GIT_TOKEN", "")
+
+        if not user or not token:
+            log.warning("GIT_USER or GIT_TOKEN not set in environment.")
+
+        return cls(user=user, token=token)
+
+
+@dataclass
+class _WallpaperState:
+    """Mutable state produced during a single pipeline run."""
+
+    commits: list[CommitDate] = field(default_factory=list)
+    week_mat: np.ndarray | None = None  # shape (7, tamY) — density grid
+    base_mat: np.ndarray | None = None  # shape (tamY, tamX, 3) — RGB image
+    active_points: list[list[int]] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# GitHub
+# ---------------------------------------------------------------------------
+
+
 class GitHub:
+    """
+    Fetches commit history from the GitHub API and renders it as a
+    pixel-art heatmap saved to disk, mirroring the GitHub contribution graph.
+
+    Workflow (call :meth:`pipeline` to execute it all at once)
+    ----------------------------------------------------------
+    1. Delete stale cached wallpapers.
+    2. Fetch all repos for the authenticated user.
+    3. Fetch commits for each repo and sort by recency.
+    4. Build a ``(7, tamY)`` density matrix (week-day × week-offset).
+    5. Render a ``(tamY, tamX, 3)`` RGB image and save it as a PNG.
+
+    Parameters
+    ----------
+    path:
+        Directory where cached wallpaper PNGs are stored.
+    """
+
     def __init__(self, path: str) -> None:
-        self.user: str = os.getenv("GIT_USER")
-        self.token: str = os.getenv("GIT_TOKEN")
+        self._cfg: _GitHubConfig = _GitHubConfig.from_env()
+        self._state: _WallpaperState = _WallpaperState()
 
-        self.url_repos: str = f"https://api.github.com/users/{self.user}/repos"
-        self.auth: dict[str, str] = {"Authorization": f"token {self.token}"}
-
+        self.path: Path = Path(path)
         self.last: str = ""
-        self.base_mat = None
-        self.path: str = path
-        self.point: list = []
-        self.commits: list = []
-        self.mat: np.array = None
-        self.data_repos: list = []
 
-        self.tamX: int = cfg.config["screen"]["x_max"]
-        self.tamY: int = cfg.config["screen"]["y_max"]
+        self.x_max: int = cfg.config["screen"]["x_max"]
+        self.y_max: int = cfg.config["screen"]["y_max"]
 
-        self.date_check()
+        self._today: datetime = datetime.today()
+        self._today_str: str = self._today.strftime("%Y-%m-%d")
+        self._filename: Path = self.path / f"github_wallpaper_{self._today_str}.png"
 
-    def date_check(self):
-        self.today: datetime = datetime.today()
-        self.today_str: str = self.today.strftime("%Y-%m-%d")
-        self.filename: str = self.path + f"github_wallpaper_{self.today_str}.png"
+        # Expose the rendered matrix for the app layer.
+        self.base_mat: np.ndarray | None = None
 
-        return not os.path.exists(self.filename)
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    def pipeline(self):
-        log.info(f"Gen new wallpaper for {self.today_str}...")
+    @property
+    def wallpaper_exists(self) -> bool:
+        """True when today's cached wallpaper is already on disk."""
+        return self._filename.exists()
+
+    def needs_refresh(self) -> bool:
+        """
+        Return True when today's wallpaper is missing or stale.
+        Re-evaluates the date so midnight rollovers are detected correctly
+        without needing to reinstantiate the class.
+        """
+        now = datetime.today()
+
+        if now.date() != self._today.date():
+            self._today = now
+            self._today_str = now.strftime("%Y-%m-%d")
+            self._filename = self.path / f"github_wallpaper_{self._today_str}.png"
+
+        return not self._filename.exists()
+
+    def pipeline(self) -> None:
+        """Fetch data and generate today's wallpaper from scratch."""
+        log.info(f"Generating new wallpaper for {self._today_str}…")
+
         try:
             self._delete_old_wallpapers()
-
-            self._get_repo()
-            self._get_commits()
-            self._create_WeekMat()
-            self._create_Wallpaper()
+            self._fetch_repos()
+            self._fetch_commits()
+            self._build_week_matrix()
+            self._render_wallpaper()
             self._save()
-
-            log.info(f"Wallpaper saved: {self.filename}")
+            log.info(f"Wallpaper saved: {self._filename}")
 
         except requests.exceptions.RequestException as e:
-            log.warning(f"Connection error to fetch GitHub API: {e}")
+            log.warning(f"Network error while fetching GitHub API: {e}")
         except Exception as e:
-            log.error(f"Error in fetch gitHub API: {e}")
+            log.error(f"Unexpected error in GitHub pipeline: {e}")
+
+    def load(self) -> None:
+        """Load today's cached wallpaper from disk into :attr:`base_mat`."""
+        try:
+            self.base_mat = np.array(Image.open(self._filename))
+        except FileNotFoundError:
+            log.error(f"Wallpaper file not found: {self._filename}")
+        except Exception as e:
+            log.error(f"Error loading wallpaper '{self._filename}': {e}")
+
+    def get_last_repo_updated(self) -> None:
+        """Fetch the most recently pushed repo and store its name in :attr:`last`."""
+        params = {"sort": "pushed", "direction": "desc", "per_page": 1}
+
+        try:
+            response = requests.get(
+                self._cfg.repos_url,
+                headers=self._cfg.auth_header,
+                params=params,
+                timeout=_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if data:
+                repo = data[0]
+                self.last = repo["name"]
+                log.info(f"Last repo: {self.last} (pushed at: {repo['pushed_at']})")
+            else:
+                log.warning("No repos found for this user.")
+
+        except requests.exceptions.RequestException as e:
+            log.warning(f"Network error in get_last_repo_updated: {e}")
+        except Exception as e:
+            log.error(f"Unexpected error in get_last_repo_updated: {e}")
+
+    # ------------------------------------------------------------------
+    # Pipeline steps
+    # ------------------------------------------------------------------
 
     def _delete_old_wallpapers(self) -> None:
-        pattern: str = self.path + "github_wallpaper_*.png"
-        old_files = glob.glob(pattern)
+        pattern = str(self.path / "github_wallpaper_*.png")
 
-        for file_path in old_files:
-            if file_path != self.filename:
+        for file_path in glob.glob(pattern):
+            if Path(file_path) != self._filename:
                 os.remove(file_path)
+                log.info(f"Deleted stale wallpaper: {file_path}")
 
-    def _get_repo(self) -> None:
-        response_repos: requests = requests.get(
-            url=self.url_repos, headers=self.auth, timeout=5
+    @_retry_on_network_error(max_attempts=3, delay=2.0)
+    def _fetch_repos(self) -> None:
+        response = requests.get(
+            url=self._cfg.repos_url,
+            headers=self._cfg.auth_header,
+            timeout=_TIMEOUT,
         )
-        response_repos.raise_for_status()
-        self.data_repos = response_repos.json()
+        response.raise_for_status()
+        self._state.commits = []  # reset before re-fetch
+        self._repos = response.json()
 
-    def _days(self, data) -> int:
-        data_format = datetime(data[0], data[1], data[2])
-        return abs((self.today - data_format).days)
+    @_retry_on_network_error(max_attempts=3, delay=2.0)
+    def _fetch_commits(self) -> None:
+        commits: list[CommitDate] = []
 
-    def _get_commits(self) -> None:
-        for repo in self.data_repos:
-            url_commits = (
-                f"https://api.github.com/repos/{self.user}/{repo['name']}/commits"
+        for repo in self._repos:
+            url = self._cfg.commits_url(repo["name"])
+            response = requests.get(
+                url, headers=self._cfg.auth_header, timeout=_TIMEOUT
             )
-            response_commits = requests.get(url_commits, headers=self.auth, timeout=5)
-            if response_commits.status_code == 200:
-                dados_commits = response_commits.json()
-                for commit in dados_commits:
-                    date = commit["commit"]["author"]["date"]
-                    date = list(date.split("T"))
-                    date = list(map(int, list(date[0].split("-"))))
-                    self.commits.append(date)
 
-        self.commits = sorted(self.commits, key=self._days, reverse=False)
+            if response.status_code != 200:
+                continue
 
-    def _create_Wallpaper(self) -> None:
-        base = np.zeros((self.tamY, self.tamX, 3), dtype=int)
+            for commit in response.json():
+                raw_date = commit["commit"]["author"]["date"].split("T")[0]
+                parts = list(map(int, raw_date.split("-")))
+                commits.append(parts)
+
+        # Sort ascending by recency (most recent first).
+        self._state.commits = sorted(commits, key=self._days_ago)
+
+    def _build_week_matrix(self) -> None:
+        """
+        Populate a ``(7, y_max)`` matrix where each cell holds the commit
+        density (0–3) for that weekday × week-offset bucket.
+        """
+        mat = np.zeros((7, self.y_max), dtype=int)
+
+        for date in self._state.commits:
+            year, month, day = date
+            delta = self.today - datetime(year, month, day)
+            week_off = delta.days // 7
+            week_day = datetime(year, month, day).weekday()
+
+            if 0 <= week_off < self.y_max:
+                count = self._state.commits.count(date)
+                mat[week_day][self.y_max - 1 - week_off] = min(count, _MAX_LEVEL)
+
+        self._state.week_mat = mat
+
+    def _render_wallpaper(self) -> None:
+        """
+        Convert :attr:`_state.week_mat` into an RGB pixel matrix.
+
+        Each commit bucket is rendered as a 2×2 green block whose brightness
+        encodes the density level (0 = black, 3 = full green).
+        """
+        mat = self._state.week_mat
+        base = np.zeros((self.y_max, self.x_max, 3), dtype=int)
+        points: list[list[int]] = []
 
         x, y = 0, 0
-        for b in range(7):
-            for a in range(self.tamY):
-                color = self.mat[b][a] * 85
+        for weekday in range(7):
+            for week_off in range(self.y_max):
+                level = mat[weekday][week_off] if mat is not None else 0
+                shade = level * _SHADE_STEP
 
-                if color == 0:
-                    self.mat[b][a] = False
-                else:
-                    self.mat[b][a] = True
-                    self.point.append([b * 2, a * 2])
+                if shade > 0:
+                    points.append([weekday * 2, week_off * 2])
 
-                base[y][x][1] = color
-                base[y][x + 1][1] = color
-                base[y + 1][x][1] = color
-                base[y + 1][x + 1][1] = color
+                # Paint a 2×2 block in the green channel.
+                for dy in range(2):
+                    for dx in range(2):
+                        base[y + dy][x + dx][1] = shade
+
                 x += 2
             y += 2
             x = 0
 
+        self._state.active_points = points
+        self._state.base_mat = base
         self.base_mat = base
 
-    def _create_WeekMat(self) -> None:
-        self.mat = np.zeros((7, self.tamY), dtype=int)
-        for date in self.commits:
-            year, month, day = date
-            formated_data = datetime(year, month, day)
-            delta = self.today - formated_data
-            week = delta.days // 7
-            week_day = formated_data.weekday()
-            if 0 <= week < self.tamY:
-                value = min(self.commits.count(date), 3)
-                self.mat[week_day][self.tamY - 1 - week] = value
-
     def _save(self) -> None:
-        if self.base_mat is None:
-            log.error("Error: base_mat not gen corrected. Nothing to save.")
+        if self._state.base_mat is None:
+            log.error("Nothing to save: base_mat was never generated.")
             return
 
-        matrix_redefinition = self.base_mat.astype(np.uint8)
-        image = Image.fromarray(matrix_redefinition, "RGB")
+        image = Image.fromarray(self._state.base_mat.astype(np.uint8), "RGB")
+        image.save(self._filename)
+        log.info(f"Wallpaper written to {self._filename}")
 
-        image.save(self.filename)
-        log.info("New github commit image saved")
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-    def load(self) -> np.array:
-        try:
-            imagem = Image.open(self.filename)
-            self.base_mat = np.array(imagem)
-        except FileNotFoundError:
-            log.error(f"Error: file {self.filename} not found.")
-        except Exception as e:
-            log.error(f"Error in {self.filename} git fetch: {e}")
+    @property
+    def today(self) -> datetime:
+        return self._today
 
-    def get_last_repo_updated(self) -> dict | None:
-        query_params = {"sort": "pushed", "direction": "desc", "per_page": 1}
-
-        try:
-            response = requests.get(
-                self.url_repos, headers=self.auth, params=query_params, timeout=5
-            )
-            response.raise_for_status()
-
-            data = response.json()
-
-            if data:
-                ultimo_repo = data[0]
-                nome_repo = ultimo_repo["name"]
-                ultimo_push = ultimo_repo["pushed_at"]
-                log.info(f"last Repo: {nome_repo} (last push: {ultimo_push})")
-                self.last = nome_repo
-            else:
-                log.warning("Repo not found")
-
-        except requests.exceptions.RequestException as e:
-            log.warning(f"Connection Error in last_repo_updated: {e}")
-        except Exception as e:
-            log.error(f"Error in last_repo_updated: {e}")
+    def _days_ago(self, date: CommitDate) -> int:
+        """Return the number of days between *date* and today (used for sorting)."""
+        year, month, day = date
+        return abs((self._today - datetime(year, month, day)).days)
